@@ -5,7 +5,11 @@ from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 import plotly.express as px
 import os
+import streamlit as st
 import google.generativeai as genai
+
+# Use the secret key
+genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
 
 # 1. Page Config
 st.set_page_config(page_title="ShopPulse AI", layout="wide", page_icon="🛍️")

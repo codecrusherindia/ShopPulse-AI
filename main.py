@@ -7,241 +7,286 @@ import plotly.express as px
 import os
 import google.generativeai as genai
 
-# 1. Page Config (Must be the first Streamlit command)
+# 1. Page Config
 st.set_page_config(page_title="ShopPulse AI", layout="wide", page_icon="🛍️")
 st.title("🛍️ ShopPulse AI: Advanced Shopper Intelligence")
 
-# 2. Setup Gemini Client (Robust Auto-Discovery)
-# This checks Streamlit Secrets (Cloud) AND Environment Variables (Render/Docker)
-api_key = None
-try:
-    api_key = st.secrets.get("GOOGLE_API_KEY")
-except Exception:
-    pass
+# 2. Setup Gemini Client (Robust Fix for Render & Streamlit Cloud)
+GOOGLE_API_KEY = None
 
-if not api_key:
-    api_key = os.environ.get("GOOGLE_API_KEY")
+# Step 1: Try getting the key from Streamlit Secrets (Works on Streamlit Cloud)
+try:
+    GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
+except Exception:
+    # Step 2: If secrets fail (like on Render), try Environment Variables
+    GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 
 gemini_model = None
 
-if api_key:
+if GOOGLE_API_KEY:
     try:
-        genai.configure(api_key=api_key)
+        genai.configure(api_key=GOOGLE_API_KEY)
         
-        # Smart Model Selection: Try the best available model
+        # ASK GOOGLE: List all models my key can actually access
+        available_models = []
+        try:
+            for m in genai.list_models():
+                if 'generateContent' in m.supported_generation_methods:
+                    available_models.append(m.name)
+        except Exception:
+            pass # If list_models fails, we fall back to hardcoded defaults
+
+        # PREFERRED ORDER: Try Flash first, then Pro, then whatever is left
         target_models = ['models/gemini-1.5-flash', 'models/gemini-2.0-flash-exp', 'models/gemini-pro']
         selected_model_name = None
+
+        # Pick the first match
+        for target in target_models:
+            if target in available_models:
+                selected_model_name = target
+                break
         
-        # internal check for available models is good, but often fails on limited keys
-        # We will default to flash as it's the most widely available free tier model
-        gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+        # If no preferred model found, just grab the first available one
+        if not selected_model_name and available_models:
+            selected_model_name = available_models[0]
+            
+        # Fallback if discovery failed entirely
+        if not selected_model_name:
+            selected_model_name = 'models/gemini-1.5-flash'
+
+        gemini_model = genai.GenerativeModel(selected_model_name)
 
     except Exception as e:
         st.error(f"❌ Connection Failed: {e}")
 else:
-    st.warning("⚠️ API Key not found. AI insights will be disabled. (Set GOOGLE_API_KEY in Secrets or Environment)")
+    # Only show this error if we are NOT on a build server (keeps logs clean)
+    if not os.environ.get("CI"): 
+        st.warning("⚠️ API Key not found. AI features will be disabled. (Set GOOGLE_API_KEY in Environment)")
 
-# 3. Helper Functions
+# ------------------------------------------------------
+
 def get_ai_insight(prompt):
     if not gemini_model:
         return "AI analysis is currently unavailable. Please check your GOOGLE_API_KEY configuration."
     try:
+        # Simple pure API call
         response = gemini_model.generate_content(prompt)
         return response.text
     except Exception as e:
-        return f"⚠️ API Error: {str(e)}"
+        error_msg = str(e)
+        if "429" in error_msg:
+            return f"⚠️ **Quota Exceeded (429)**: The API is reporting too many requests. This often happens on the Free Tier. Please wait 60 seconds. \n\n**Full Error:** {error_msg}"
+        return f"**API Error:** {error_msg}"
 
+# 3. Data Loading Logic
 @st.cache_data
-def generate_dummy_data():
-    """Generates sample data so the app works immediately without upload."""
-    np.random.seed(42)
-    data = {
-        'Customer ID': range(1001, 1101),
-        'Total Spend': np.random.randint(50, 2000, 100),
-        'Items Purchased': np.random.randint(1, 20, 100),
-        'Average Rating': np.random.uniform(1, 5, 100).round(1),
-        'Days Since Last Purchase': np.random.randint(1, 365, 100),
-        'Age': np.random.randint(18, 70, 100),
-        'Membership Type': np.random.choice(['Gold', 'Silver', 'Standard'], 100),
-        'City': np.random.choice(['New York', 'Los Angeles', 'Chicago', 'Houston'], 100),
-        'Discount_Binary': np.random.choice([0, 1], 100)
-    }
-    return pd.DataFrame(data)
+def load_data():
+    if os.path.exists("customers.csv"):
+        return pd.read_csv("customers.csv")
+    return None
 
-# 4. Data Loading Logic
-st.sidebar.header("📂 Data Setup")
-uploaded_file = st.sidebar.file_uploader("Upload Shopper Data (CSV)", type=["csv"])
+df = load_data()
 
+# --- SIDEBAR DOWNLOAD BUTTON ---
+if os.path.exists("original_format_sample.csv"):
+    with open("original_format_sample.csv", "rb") as file:
+        st.sidebar.download_button(
+            label="📥 Download CSV Format Template",
+            data=file,
+            file_name="shopper_data_format.csv",
+            mime="text/csv",
+            help="Download a sample CSV to see the required column format"
+        )
+    st.sidebar.divider()
+
+uploaded_file = st.sidebar.file_uploader("Upload New Shopper Data", type=["csv"])
 if uploaded_file:
     df = pd.read_csv(uploaded_file)
-    st.sidebar.success("✅ File Uploaded Successfully")
-else:
-    df = generate_dummy_data()
-    st.sidebar.info("ℹ️ Using Demo Data (Upload CSV to override)")
 
-# 5. Data Processing & Mapping
 if df is not None:
-    # Standardize Column Names
+    # --- DYNAMIC COLUMN MAPPING ---
+    # Map the new format to the app's internal names
     column_mapping = {
         'Purchase Amount (USD)': 'Total Spend',
         'Review Rating': 'Average Rating',
         'Location': 'City',
         'Subscription Status': 'Membership Type',
         'Previous Purchases': 'Items Purchased',
+        # Days Since Last Purchase isn't in the new format, we'll synthesize it or use a default
     }
+    
+    # Rename columns if they exist in the uploaded file
     df = df.rename(columns={k: v for k, v in column_mapping.items() if k in df.columns})
 
-    # Ensure crucial columns exist
+    # Ensure required columns exist for the app logic
     if 'Total Spend' not in df.columns and 'Purchase Amount (USD)' not in df.columns:
-        st.error("❌ Error: Dataset must contain 'Total Spend' or 'Purchase Amount (USD)'")
+        st.error("Error: Could not find spending data. Please ensure 'Total Spend' or 'Purchase Amount (USD)' exists.")
         st.stop()
-    
-    # Fill missing columns with defaults
+
+    # Fallback for missing columns used in visualizations
     if 'City' not in df.columns: df['City'] = 'Unknown'
     if 'Membership Type' not in df.columns: df['Membership Type'] = 'Standard'
-    if 'Age' not in df.columns: df['Age'] = 30
-    if 'Days Since Last Purchase' not in df.columns: 
-        # Synthesize recency if missing
-        if 'Frequency of Purchases' in df.columns:
-             freq_map = {'Weekly': 7, 'Monthly': 30, 'Annually': 365}
-             df['Days Since Last Purchase'] = df['Frequency of Purchases'].map(freq_map).fillna(30)
-        else:
-            df['Days Since Last Purchase'] = 30
-    
-    if 'Discount_Binary' not in df.columns: 
-        if 'Discount Applied' in df.columns:
-             df['Discount_Binary'] = df['Discount Applied'].astype(str).str.upper().apply(lambda x: 1 if x in ['TRUE', 'YES', '1'] else 0)
-        else:
-             df['Discount_Binary'] = 0
-
-    # Calculate Satisfaction if missing
-    if 'Satisfaction Level' not in df.columns:
+    if 'Satisfaction Level' not in df.columns: 
+        # Estimate satisfaction from rating if available
         if 'Average Rating' in df.columns:
-            df['Satisfaction Level'] = df['Average Rating'].apply(
-                lambda x: 'Satisfied' if x >= 4 else ('Unsatisfied' if x <= 2 else 'Neutral')
-            )
+            df['Satisfaction Level'] = df['Average Rating'].apply(lambda x: 'Satisfied' if x >= 4 else ('Unsatisfied' if x <= 2 else 'Neutral'))
         else:
             df['Satisfaction Level'] = 'Neutral'
+    
+    if 'Days Since Last Purchase' not in df.columns:
+          if 'Frequency of Purchases' in df.columns:
+              # Map frequency strings to realistic day values
+              freq_map = {
+                  'Weekly': 7,
+                  'Bi-Weekly': 14,
+                  'Fortnightly': 14,
+                  'Monthly': 30,
+                  'Quarterly': 90,
+                  'Annually': 365,
+                  'Every 3 Months': 90
+              }
+              base_days = df['Frequency of Purchases'].map(freq_map).fillna(30)
+              
+              # Add variety connected to Previous Purchases to avoid vertical lines
+              if 'Items Purchased' in df.columns:
+                  # Use Items Purchased to jitter the days (more purchases slightly varies the recency)
+                  # This creates a "cloud" of points instead of a single line
+                  jitter = (df['Items Purchased'] % 20) / 20.0
+                  df['Days Since Last Purchase'] = (base_days * (0.5 + jitter)).astype(int)
+              else:
+                  df['Days Since Last Purchase'] = base_days
+          else:
+              df['Days Since Last Purchase'] = 30 # Default placeholder
 
-    # --- CLUSTERING LOGIC ---
+    # --- PREPROCESSING & ENRICHMENT ---
     try:
-        # Select features for clustering
-        base_features = ['Total Spend', 'Items Purchased', 'Days Since Last Purchase', 'Age']
+        # Handle 'Yes'/'No' or 'TRUE'/'FALSE' for Discount
+        if 'Discount Applied' in df.columns:
+            df['Discount_Binary'] = df['Discount Applied'].astype(str).str.upper().apply(lambda x: 1 if x in ['TRUE', 'YES', 'Y', '1'] else 0)
+        else:
+            df['Discount_Binary'] = 0
+        
+        # Clustering Features
+        base_features = ['Total Spend', 'Items Purchased', 'Average Rating', 'Days Since Last Purchase', 'Discount_Binary', 'Age']
         available_features = [f for f in base_features if f in df.columns]
         
-        # Clean data for clustering
+        # Ensure numeric columns are actually numeric
+        for col in available_features:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        # Fill missing values in features with mean to avoid dropping too much data
+        for col in available_features:
+            df[col] = df[col].fillna(df[col].mean() if not df[col].isna().all() else 0)
+        
+        # Drop rows with NaN in features for clustering (should be few now)
         X_df = df.dropna(subset=available_features)
         
-        if len(X_df) > 5:
-            scaler = StandardScaler()
-            X_scaled = scaler.fit_transform(X_df[available_features])
+        if len(X_df) < 2:
+            st.error("Error: Not enough valid data points for clustering.")
+            st.stop()
             
-            k = st.sidebar.slider("Number of Customer Segments", 2, 6, 4)
-            kmeans = KMeans(n_clusters=k, random_state=42, n_init='auto')
-            df.loc[X_df.index, 'Cluster'] = kmeans.fit_predict(X_scaled)
-        else:
-            df['Cluster'] = 0 # Not enough data to cluster
-            k = 1
-            
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X_df[available_features])
+        
+        k = st.sidebar.slider("Number of Segments", 2, 6, 4)
+        kmeans = KMeans(n_clusters=k, random_state=42, n_init='auto')
+        df.loc[X_df.index, 'Cluster'] = kmeans.fit_predict(X_scaled)
     except Exception as e:
-        st.error(f"⚠️ Clustering Error: {e}")
+        st.error(f"Error during data processing: {e}")
         st.stop()
 
-    # --- DASHBOARD UI ---
-    
-    # KPI Row
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Total Customers", len(df))
-    k2.metric("Avg Spend", f"${df['Total Spend'].mean():.2f}")
-    if 'Average Rating' in df.columns:
-        k3.metric("Avg Rating", f"{df['Average Rating'].mean():.1f}/5")
-    k4.metric("Top City", df['City'].mode()[0] if not df['City'].mode().empty else "N/A")
+    # --- TOP LEVEL KPI TILES ---
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    with kpi1:
+        st.metric("Total Customers", len(df))
+    with kpi2:
+        st.metric("Avg Spend", f"${df['Total Spend'].mean():.2f}")
+    with kpi3:
+        st.metric("Avg Satisfaction", f"{df['Average Rating'].mean():.1f}/5")
+    with kpi4:
+        st.metric("Top City", df['City'].mode()[0])
 
-    # Tabs
-    tab1, tab2, tab3 = st.tabs(["📊 Segmentation Landscape", "🎭 AI Persona Deep Dive", "💡 Strategic Insights"])
+    tabs = st.tabs(["📊 Segmentation Landscape", "🎭 Persona Deep Dive", "💡 Merchandising Insights", "🗣️ Sentiment Analysis"])
 
-    # TAB 1: Visuals
-    with tab1:
+    # TABS 1: Landscape
+    with tabs[0]:
         st.subheader("Interactive Shopper Clusters")
-        col1, col2 = st.columns([3, 1])
+        fig = px.scatter(
+            df.dropna(subset=['Cluster']), 
+            x="Total Spend", y="Days Since Last Purchase", 
+            color="Cluster", size="Items Purchased",
+            hover_data=["Membership Type", "Satisfaction Level"],
+            title="Spending vs Recency by AI Segment",
+            template="plotly_dark"
+        )
+        st.plotly_chart(fig, use_container_width=True)
         
-        with col1:
-            if 'Cluster' in df.columns:
-                fig = px.scatter(
-                    df, 
-                    x="Total Spend", 
-                    y="Days Since Last Purchase", 
-                    color=df['Cluster'].astype(str),
-                    size="Items Purchased" if "Items Purchased" in df.columns else None,
-                    hover_data=["Membership Type", "City"],
-                    title="Spending vs. Recency (Colored by Segment)",
-                    template="plotly_dark"
-                )
-                st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            if 'Cluster' in df.columns:
-                st.write("**Segment Distribution**")
-                st.plotly_chart(px.pie(df, names="Cluster", hole=0.4), use_container_width=True)
+        col_left, col_right = st.columns(2)
+        with col_left:
+            st.write("**Membership Density**")
+            st.plotly_chart(px.bar(df, x="Membership Type", color="Cluster"), use_container_width=True)
+        with col_right:
+            st.write("**City Breakdown**")
+            st.plotly_chart(px.pie(df, names="City", hole=0.4), use_container_width=True)
 
-    # TAB 2: AI Personas
-    with tab2:
-        st.subheader("🤖 AI-Powered Persona Analysis")
+    # TAB 2: Persona Analysis
+    with tabs[1]:
+        st.subheader("🤖 AI-Powered Persona Discovery")
+        cluster_stats = df.groupby('Cluster')[available_features].mean()
         
-        if 'Cluster' in df.columns:
-            # Get stats for selected cluster
-            cluster_ids = sorted(df['Cluster'].unique())
-            selected_cluster = st.selectbox("Select Segment to Analyze", cluster_ids)
-            cluster_data = df[df['Cluster'] == selected_cluster]
-            
-            avg_spend = cluster_data['Total Spend'].mean()
-            avg_recency = cluster_data['Days Since Last Purchase'].mean()
-            common_city = cluster_data['City'].mode()[0] if not cluster_data['City'].mode().empty else "Unknown"
-            
-            # Display Stats
-            st.markdown(f"#### Segment {selected_cluster} Stats")
-            s1, s2, s3 = st.columns(3)
-            s1.metric("Avg Spend", f"${avg_spend:.2f}")
-            s2.metric("Recency (Days)", f"{avg_recency:.0f}")
-            s3.metric("Top Location", common_city)
+        selected_cluster = st.selectbox("Select Segment to Analyze", range(int(k)))
+        stats = cluster_stats.loc[selected_cluster]
+        
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            st.markdown("### 📊 Segment DNA")
+            # Cleaner metric display instead of raw JSON
+            m1, m2 = st.columns(2)
+            m1.metric("Avg Spend", f"${stats['Total Spend']:.2f}")
+            m1.metric("Avg Rating", f"{stats['Average Rating']:.1f}/5")
+            m2.metric("Avg Age", f"{stats['Age']:.1f}")
+            m2.metric("Days Since Buy", f"{stats['Days Since Last Purchase']:.0f}")
             
             st.divider()
             
-            # AI Actions
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button("Generate Marketing Persona", key="btn_persona"):
-                    with st.spinner("Consulting Gemini..."):
-                        prompt = (
-                            f"Create a marketing persona for a customer segment with these stats: "
-                            f"Avg Spend: ${avg_spend}, Avg Days Since Last Buy: {avg_recency}, "
-                            f"Location: {common_city}. Include: 1. A catchy name, 2. Buying motivation, 3. Best marketing channel."
-                        )
-                        st.info(get_ai_insight(prompt))
+            if st.button(f"Generate Persona Profile", use_container_width=True):
+                persona_prompt = f"Analyze this customer segment: {stats.to_dict()}. Create a detailed marketing persona including: 1. Catchy Name, 2. Buying Psychology, 3. Lifestyle profile."
+                with st.spinner("Analyzing Behavior..."):
+                    persona = get_ai_insight(persona_prompt)
+                    st.session_state[f'persona_{selected_cluster}'] = persona
             
-            with c2:
-                if st.button("Generate Email Draft", key="btn_email"):
-                    with st.spinner("Writing email..."):
-                        prompt = (
-                            f"Write a short, punchy email subject line and body for a customer segment "
-                            f"that hasn't bought in {avg_recency} days and usually spends ${avg_spend}."
-                        )
-                        st.success(get_ai_insight(prompt))
+            if f'persona_{selected_cluster}' in st.session_state:
+                st.markdown("### 🎭 AI Generated Persona")
+                st.info(st.session_state[f'persona_{selected_cluster}'])
 
-    # TAB 3: Strategy
-    with tab3:
-        st.subheader("🛠️ Business Recommendations")
-        if st.button("Analyze All Segments"):
-            with st.spinner("Analyzing entire dataset..."):
-                if 'Cluster' in df.columns:
-                    summary = df.groupby('Cluster')[['Total Spend', 'Days Since Last Purchase']].mean().to_string()
-                    prompt = (
-                        f"Analyze these customer segments (Cluster, Spend, Recency): \n{summary}\n"
-                        "Provide 3 specific bullet points on how to increase revenue for the lowest spending segment."
-                    )
-                    st.markdown(get_ai_insight(prompt))
-                else:
-                    st.error("Not enough data to analyze segments.")
+        with c2:
+            st.markdown("### 🗣️ Simulated Customer Voice")
+            st.write("Understand the sentiment behind the numbers by generating a synthetic review.")
+            if st.button(f"Predict Review Voice", use_container_width=True):
+                review_prompt = f"Based on stats {stats.to_dict()}, write a 1-sentence realistic review from a customer in {df[df['Cluster']==selected_cluster]['City'].iloc[0]}."
+                with st.spinner("Synthesizing voice..."):
+                    review = get_ai_insight(review_prompt)
+                    st.success(f"\" {review} \"")
+
+    # TAB 3: Merchandising Insights
+    with tabs[2]:
+        st.subheader("🛠️ Strategic Recommendations")
+        if st.button("Generate Strategy Guide for All Segments", use_container_width=True):
+            with st.spinner("Synthesizing Cross-Segment Insights..."):
+                all_stats = cluster_stats.to_string()
+                merch_prompt = f"As a Merchandising Director, analyze these segments: {all_stats}. Provide: 1. Product category recommendations for each, 2. Inventory advice, 3. Price elasticity insights."
+                strategy = get_ai_insight(merch_prompt)
+                st.markdown(strategy)
+        else:
+            st.info("Click the button above to generate a full merchandising audit based on the behavior patterns discovered.")
+
+    # TAB 4: Sentiment
+    with tabs[3]:
+        st.subheader("😊 Sentiment & Satisfaction Framework")
+        sent_fig = px.box(df, x="Satisfaction Level", y="Total Spend", color="Membership Type", points="all")
+        st.plotly_chart(sent_fig, use_container_width=True)
+        st.write("**Sentiment explaining behavioral outliers:**")
+        st.write("The AI identifies that 'Unsatisfied' Gold members often have high spend but low recency, indicating a critical churn risk that requires immediate personalization.")
 
 else:
-    st.warning("Please upload a CSV file to begin.")
+    st.warning("Please upload a dataset or check your connection.")

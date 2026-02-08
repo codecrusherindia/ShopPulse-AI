@@ -1,3 +1,17 @@
+import os
+import subprocess
+import sys
+
+# Function to install missing packages
+def install(package):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+# Try importing. If it fails, install and try again.
+try:
+    import google.generativeai as genai
+except ImportError:
+    install("google-generativeai")
+    import google.generativeai as genai
 import streamlit as st
 import pandas as pd
 import numpy as np

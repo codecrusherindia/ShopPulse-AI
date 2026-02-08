@@ -1,0 +1,27 @@
+[deployment]
+run = ["python", "-m", "streamlit", "run", "main.py", "--server.address=0.0.0.0", "--server.port=5000", "--server.headless=true"]
+
+[unitTest]
+language = "python3"
+
+[gitHubImport]
+requiredFiles = ["main.py", "pyproject.toml"]
+
+[workflows]
+runButton = "Run App"
+
+[[workflows.workflow]]
+name = "Run App"
+mode = "parallel"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "streamlit run main.py --server.address 0.0.0.0 --server.port 5000"
+waitForPort = 5000
+
+[workflows.workflow.metadata]
+outputType = "webview"
+
+[[ports]]
+localPort = 5000
+externalPort = 80
